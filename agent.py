@@ -19,6 +19,7 @@ Usage (once implemented):
 """
 
 from tools import search_listings, suggest_outfit, create_fit_card
+import re
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -42,6 +43,56 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+    }
+
+
+def _parse_query(query: str) -> dict:
+    """Extract deterministic search parameters from a natural language query."""
+    cleaned = query.lower()
+
+    price_match = re.search(
+        r"(?:under|below|less than|up to|max(?:imum)?|budget(?: is)?|<=?)\s*\$?\s*(\d+(?:\.\d+)?)",
+        cleaned,
+    )
+    if not price_match:
+        price_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", cleaned)
+    max_price = float(price_match.group(1)) if price_match else None
+
+    size = None
+    size_match = re.search(
+        r"(?:size|in size)\s+([a-z]{1,3}(?:/[a-z]{1,3})?|us\s*\d+(?:\.\d+)?|w\d{2}(?:\s*l\d{2})?)\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if size_match:
+        size = size_match.group(1).upper().replace("US ", "US ")
+    else:
+        standalone_size = re.search(r"\b(us\s*\d+(?:\.\d+)?|w\d{2}(?:\s*l\d{2})?)\b", cleaned)
+        if standalone_size:
+            size = standalone_size.group(1).upper()
+
+    description = query
+    description = re.sub(
+        r"(?:under|below|less than|up to|max(?:imum)?|budget(?: is)?|<=?)\s*\$?\s*\d+(?:\.\d+)?",
+        " ",
+        description,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(r"\$\s*\d+(?:\.\d+)?", " ", description)
+    description = re.sub(
+        r"(?:in\s+)?size\s+[a-z0-9./ ]{1,10}\b",
+        " ",
+        description,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(r"\b(us\s*\d+(?:\.\d+)?|w\d{2}(?:\s*l\d{2})?)\b", " ", description, flags=re.IGNORECASE)
+    description = re.sub(r"[^a-zA-Z0-9]+", " ", description)
+    description = re.sub(r"\s+", " ", description).strip()
+
+    return {
+        "description": description or query.strip(),
+        "size": size,
+        "max_price": max_price,
     }
 
 
@@ -92,9 +143,37 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    parsed = _parse_query(query)
+    session["parsed"] = parsed
+
+    results = search_listings(
+        parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+    session["search_results"] = results
+
+    if not results:
+        session["error"] = (
+            "No listings matched your search. Try loosening the size, raising "
+            "the max price, or using broader style terms."
+        )
+        return session
+
+    session["selected_item"] = results[0]
+
+    outfit = suggest_outfit(session["selected_item"], session["wardrobe"])
+    session["outfit_suggestion"] = outfit
+    if not outfit or not outfit.strip():
+        session["error"] = (
+            "FitFindr found a listing, but could not create an outfit suggestion. "
+            "Try again with a little more wardrobe context."
+        )
+        return session
+
+    session["fit_card"] = create_fit_card(outfit, session["selected_item"])
     return session
 
 
