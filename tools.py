@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,32 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+
+_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "how",
+    "i",
+    "im",
+    "in",
+    "it",
+    "looking",
+    "mostly",
+    "out",
+    "the",
+    "there",
+    "to",
+    "under",
+    "wear",
+    "what",
+    "whats",
+    "with",
+    "would",
+}
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -32,6 +59,146 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _chat_completion(messages: list[dict], temperature: float = 0.7) -> str | None:
+    """Return Groq text, or None if the call cannot complete locally."""
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=300,
+        )
+        content = response.choices[0].message.content
+    except Exception:
+        return None
+
+    if not content or not content.strip():
+        return None
+    return content.strip()
+
+
+def _normalize_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def _keyword_tokens(description: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", description.lower())
+    return [token for token in tokens if token not in _STOP_WORDS and len(token) > 1]
+
+
+def _listing_search_text(listing: dict) -> str:
+    parts = [
+        listing.get("title", ""),
+        listing.get("description", ""),
+        listing.get("category", ""),
+        listing.get("size", ""),
+        listing.get("condition", ""),
+        listing.get("brand") or "",
+        listing.get("platform", ""),
+        " ".join(listing.get("style_tags", [])),
+        " ".join(listing.get("colors", [])),
+    ]
+    return _normalize_text(" ".join(parts))
+
+
+def _size_matches(listing_size: str, requested_size: str | None) -> bool:
+    if not requested_size:
+        return True
+
+    requested = _normalize_text(requested_size)
+    available = _normalize_text(listing_size)
+    if requested == available or requested in available:
+        return True
+
+    requested_tokens = set(requested.split())
+    available_tokens = set(available.split())
+    return bool(requested_tokens & available_tokens)
+
+
+def _score_listing(listing: dict, description: str) -> int:
+    search_text = _listing_search_text(listing)
+    normalized_description = _normalize_text(description)
+    tokens = _keyword_tokens(description)
+    score = 0
+
+    if normalized_description and normalized_description in search_text:
+        score += 6
+
+    title_text = _normalize_text(listing.get("title", ""))
+    tag_text = _normalize_text(" ".join(listing.get("style_tags", [])))
+    color_text = _normalize_text(" ".join(listing.get("colors", [])))
+
+    for token in tokens:
+        if token in search_text:
+            score += 1
+        if token in title_text:
+            score += 2
+        if token in tag_text:
+            score += 2
+        if token in color_text:
+            score += 1
+
+    return score
+
+
+def _format_item_summary(item: dict) -> str:
+    brand = item.get("brand") or "unbranded"
+    tags = ", ".join(item.get("style_tags", [])[:4])
+    colors = ", ".join(item.get("colors", []))
+    return (
+        f"{item.get('title')} ({brand}) - {item.get('category')}, "
+        f"size {item.get('size')}, ${item.get('price'):.0f} on "
+        f"{item.get('platform')}; colors: {colors}; tags: {tags}"
+    )
+
+
+def _fallback_outfit(new_item: dict, wardrobe: dict) -> str:
+    title = new_item.get("title", "this find")
+    colors = ", ".join(new_item.get("colors", [])) or "its main colors"
+    tags = ", ".join(new_item.get("style_tags", [])[:3]) or "secondhand"
+    wardrobe_items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+
+    if not wardrobe_items:
+        return (
+            f"For a new wardrobe, build around {title} by pairing the {colors} tones "
+            f"with relaxed denim or simple trousers, then add sneakers or boots that "
+            f"match the {tags} vibe. Keep accessories simple so the thrifted piece "
+            "stays the focus."
+        )
+
+    bottoms = [item for item in wardrobe_items if item.get("category") == "bottoms"]
+    shoes = [item for item in wardrobe_items if item.get("category") == "shoes"]
+    outerwear = [item for item in wardrobe_items if item.get("category") == "outerwear"]
+    accessories = [
+        item for item in wardrobe_items if item.get("category") == "accessories"
+    ]
+
+    bottom = bottoms[0]["name"] if bottoms else "your most relaxed bottoms"
+    shoe = shoes[0]["name"] if shoes else "a comfortable everyday shoe"
+    layer = outerwear[0]["name"] if outerwear else "a light layer"
+    accessory = accessories[0]["name"] if accessories else "a simple bag or belt"
+
+    return (
+        f"Style {title} with {bottom} and {shoe} for an easy {tags} outfit. "
+        f"Add {layer} if you want more shape, then finish with {accessory}. "
+        "Keep the proportions relaxed: let one piece fit oversized and keep the "
+        "rest clean so the look feels intentional."
+    )
+
+
+def _fallback_fit_card(outfit: str, new_item: dict) -> str:
+    title = new_item.get("title", "this thrifted piece")
+    price = new_item.get("price", 0)
+    platform = new_item.get("platform", "a resale app")
+    vibe = ", ".join(new_item.get("style_tags", [])[:2]) or "secondhand"
+    return (
+        f"Found {title} on {platform} for ${price:.0f}, and it pulls the whole "
+        f"{vibe} mood together. {outfit.strip()} Easy thrift win with enough "
+        "texture to look styled without trying too hard."
+    )
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +236,21 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    scored_results: list[tuple[int, dict]] = []
+
+    for listing in listings:
+        if max_price is not None and float(listing.get("price", 0)) > max_price:
+            continue
+        if not _size_matches(str(listing.get("size", "")), size):
+            continue
+
+        score = _score_listing(listing, description)
+        if score > 0:
+            scored_results.append((score, listing))
+
+    scored_results.sort(key=lambda result: (-result[0], result[1].get("price", 0)))
+    return [listing for _, listing in scored_results]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +280,46 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    wardrobe_items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+    item_summary = _format_item_summary(new_item)
+
+    if wardrobe_items:
+        wardrobe_summary = "\n".join(
+            f"- {item['name']} ({item['category']}; "
+            f"colors: {', '.join(item.get('colors', []))}; "
+            f"tags: {', '.join(item.get('style_tags', []))}; "
+            f"notes: {item.get('notes') or 'none'})"
+            for item in wardrobe_items
+        )
+        user_prompt = (
+            "Suggest one complete outfit using this thrift listing and named "
+            "pieces from the wardrobe.\n\n"
+            f"New item: {item_summary}\n\n"
+            f"Wardrobe:\n{wardrobe_summary}\n\n"
+            "Return 3-5 practical sentences. Name the exact wardrobe pieces."
+        )
+    else:
+        user_prompt = (
+            "The user has a new or empty wardrobe. Suggest general styling "
+            "ideas for this thrift listing without pretending they own items.\n\n"
+            f"New item: {item_summary}\n\n"
+            "Return 3-5 practical sentences with item types to pair it with."
+        )
+
+    content = _chat_completion(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are FitFindr, a practical secondhand fashion stylist. "
+                    "Be specific, concise, and wearable."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.6,
+    )
+    return content or _fallback_outfit(new_item, wardrobe)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +351,30 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return "Unable to create a fit card because the outfit suggestion is missing."
+
+    item_summary = _format_item_summary(new_item)
+    content = _chat_completion(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You write casual social captions for thrifted outfits. "
+                    "Do not sound like a product listing."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Write a 2-4 sentence fit card caption. Mention the item "
+                    "title, price, and platform naturally once each. Capture "
+                    "the outfit vibe in specific terms.\n\n"
+                    f"New item: {item_summary}\n\n"
+                    f"Outfit: {outfit.strip()}"
+                ),
+            },
+        ],
+        temperature=0.9,
+    )
+    return content or _fallback_fit_card(outfit, new_item)
